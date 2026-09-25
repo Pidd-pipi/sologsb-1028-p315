@@ -21,6 +21,26 @@ export interface ComponentExample {
   createdFromRevision: number;
 }
 
+export interface DeprecationMigration {
+  exampleId: string;
+  exampleTitle: string;
+  oldReference: string;
+  done: boolean;
+  doneAt: string | null;
+}
+
+export interface DeprecationRecord {
+  id: string;
+  propertyId: string;
+  propertyName: string;
+  replacementPropertyId: string | null;
+  replacementName: string;
+  sunsetVersion: number;
+  createdAt: string;
+  status: 'migrating' | 'done';
+  migrations: DeprecationMigration[];
+}
+
 export interface ComponentSpec {
   id: string;
   name: string;
@@ -35,6 +55,7 @@ export interface ComponentSpec {
   disabledScenarios: string;
   interactionSignature: string;
   examples: ComponentExample[];
+  deprecations: DeprecationRecord[];
   revision: number;
   updatedAt: string;
   snapshots: ComponentSnapshot[];

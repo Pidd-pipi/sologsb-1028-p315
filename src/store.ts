@@ -1,5 +1,5 @@
 import { createInitialState } from './data';
-import type { ComponentSnapshot, ComponentSpec, ValidationIssue, WorkspaceState } from './types';
+import type { ComponentSnapshot, ComponentSpec, DeprecationRecord, ValidationIssue, WorkspaceState } from './types';
 
 const STORAGE_KEY = 'sologsb-1028-workspace-v1';
 
@@ -49,6 +49,7 @@ export class SpecStore extends EventTarget {
       disabledScenarios: '记录不应使用该组件的场景。',
       interactionSignature: '',
       examples: [],
+      deprecations: [],
       revision: 1,
       updatedAt: new Date().toISOString(),
       snapshots: []
@@ -62,6 +63,7 @@ export class SpecStore extends EventTarget {
   updateComponent(patch: Partial<ComponentSpec>, markExamplesStale = false) {
     const selected = this.selected;
     if (!selected) return;
+    if (patch.status === 'published' && this.hasPendingMigrations(selected)) return;
     this.commit('编辑组件', (state) => {
       const target = state.components.find((item) => item.id === selected.id);
       if (!target) return;
@@ -115,6 +117,79 @@ export class SpecStore extends EventTarget {
         }
       });
     });
+  }
+
+  deprecateProperty(propertyId: string, replacementId: string | null, sunsetVersion: number) {
+    const selected = this.selected;
+    if (!selected) return;
+    this.commit('废弃属性', (state) => {
+      const target = state.components.find((item) => item.id === selected.id);
+      const property = target?.properties.find((item) => item.id === propertyId);
+      if (!target || !property) return;
+      if (target.deprecations.some((record) => record.propertyId === propertyId && record.status !== 'done')) return;
+      const replacement = target.properties.find((item) => item.id === replacementId) ?? null;
+      const affected = target.examples.filter((example) => example.propertyIds.includes(propertyId) || example.code.includes(property.name));
+      const record: DeprecationRecord = {
+        id: uid('deprecation'),
+        propertyId,
+        propertyName: property.name,
+        replacementPropertyId: replacement?.id ?? null,
+        replacementName: replacement?.name ?? '',
+        sunsetVersion,
+        createdAt: new Date().toISOString(),
+        status: affected.length ? 'migrating' : 'done',
+        migrations: affected.map((example) => ({
+          exampleId: example.id,
+          exampleTitle: example.title,
+          oldReference: example.code,
+          done: false,
+          doneAt: null
+        }))
+      };
+      target.deprecations.unshift(record);
+      affected.forEach((example) => {
+        example.stale = true;
+        example.staleReason = replacement
+          ? `属性 ${property.name} 已废弃，将于 r${sunsetVersion} 失效，请迁移到 ${replacement.name}。`
+          : `属性 ${property.name} 已废弃，将于 r${sunsetVersion} 失效；无替代属性，属于破坏性变更。`;
+      });
+      target.updatedAt = new Date().toISOString();
+    });
+  }
+
+  completeDeprecationMigration(deprecationId: string, exampleId: string) {
+    const selected = this.selected;
+    if (!selected) return;
+    this.commit('迁移废弃属性示例', (state) => {
+      const target = state.components.find((item) => item.id === selected.id);
+      const record = target?.deprecations.find((item) => item.id === deprecationId);
+      const migration = record?.migrations.find((item) => item.exampleId === exampleId);
+      const example = target?.examples.find((item) => item.id === exampleId);
+      if (!target || !record || !migration || !example || migration.done) return;
+      if (record.replacementPropertyId) {
+        const replacement = target.properties.find((item) => item.id === record.replacementPropertyId);
+        if (replacement && replacement.name !== record.propertyName) {
+          example.code = example.code.split(record.propertyName).join(replacement.name);
+        }
+        example.propertyIds = [...new Set([...example.propertyIds.filter((id) => id !== record.propertyId), record.replacementPropertyId])];
+      } else {
+        example.propertyIds = example.propertyIds.filter((id) => id !== record.propertyId);
+      }
+      migration.done = true;
+      migration.doneAt = new Date().toISOString();
+      const stillPending = target.deprecations.some((item) => item.migrations.some((entry) => entry.exampleId === exampleId && !entry.done));
+      if (!stillPending) {
+        example.stale = false;
+        example.staleReason = '';
+        example.createdFromRevision = target.revision;
+      }
+      record.status = record.migrations.every((item) => item.done) ? 'done' : 'migrating';
+      target.updatedAt = new Date().toISOString();
+    });
+  }
+
+  hasPendingMigrations(component: ComponentSpec): boolean {
+    return component.deprecations.some((record) => record.migrations.some((migration) => !migration.done));
   }
 
   addExample() {
@@ -225,6 +300,19 @@ export class SpecStore extends EventTarget {
       if (contractChanged && component.examples.length) {
         issues.push({ id: `${component.id}-contract`, level: 'info', componentId: component.id, target: component.name, message: '属性契约或交互签名发生变化，建议创建快照并迁移示例。', field: 'properties' });
       }
+      for (const record of component.deprecations) {
+        const pending = record.migrations.filter((migration) => !migration.done);
+        if (!pending.length) continue;
+        const replacement = record.replacementName ? `替代属性 ${record.replacementName}` : '无替代（破坏性变更）';
+        issues.push({
+          id: `${component.id}-${record.id}-pending`,
+          level: component.status === 'published' ? 'error' : 'warning',
+          componentId: component.id,
+          target: record.propertyName,
+          message: `废弃迁移未完成：${replacement}，r${record.sunsetVersion} 失效，还剩 ${pending.length} 个示例待处理。完成前组件不能进入已发布状态。`,
+          field: 'properties'
+        });
+      }
     }
     return issues;
   }
@@ -271,7 +359,11 @@ export class SpecStore extends EventTarget {
   private load(): WorkspaceState {
     try {
       const saved = localStorage.getItem(STORAGE_KEY);
-      if (saved) return JSON.parse(saved) as WorkspaceState;
+      if (saved) {
+        const parsed = JSON.parse(saved) as WorkspaceState;
+        parsed.components.forEach((component) => { component.deprecations ??= []; });
+        return parsed;
+      }
     } catch {
       // A corrupted local draft falls back to the bundled demo data.
     }

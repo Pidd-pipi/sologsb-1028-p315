@@ -2,7 +2,7 @@ import { LitElement, css, html, nothing, type TemplateResult } from 'lit';
 import { repeat } from 'lit/directives/repeat.js';
 import { diffAgainstSnapshot } from './diff';
 import { SpecStore } from './store';
-import type { ComponentExample, ComponentSpec, PreviewDensity, PreviewTheme, PropertySpec, ValidationIssue } from './types';
+import type { ComponentExample, ComponentSpec, DeprecationRecord, PreviewDensity, PreviewTheme, PropertySpec, ValidationIssue } from './types';
 
 type EditorTab = 'overview' | 'api' | 'accessibility' | 'examples' | 'history';
 
@@ -13,7 +13,9 @@ export class SpecA11yWorkbench extends LitElement {
     previewTheme: { state: true },
     previewDensity: { state: true },
     toast: { state: true },
-    showValidation: { state: true }
+    showValidation: { state: true },
+    deprecatingPropertyId: { state: true },
+    deprecationDraft: { state: true }
   };
 
   private store = new SpecStore();
@@ -23,6 +25,8 @@ export class SpecA11yWorkbench extends LitElement {
   private previewDensity: PreviewDensity = 'regular';
   private toast = '';
   private showValidation = true;
+  private deprecatingPropertyId: string | null = null;
+  private deprecationDraft: { replacementId: string; sunsetVersion: number } = { replacementId: '', sunsetVersion: 1 };
   private toastTimer?: number;
 
   static styles = css`
@@ -88,7 +92,14 @@ export class SpecA11yWorkbench extends LitElement {
     textarea:focus, input:focus, select:focus { outline: 3px solid var(--spectrum-blue-400); outline-offset: 1px; border-color: var(--spectrum-blue-700); }
     textarea { min-height: 110px; resize: vertical; }
     .property-list, .example-list { display: grid; gap: 12px; }
-    .property-card, .example-card { border: 1px solid var(--spectrum-gray-300); border-radius: 12px; padding: 14px; background: var(--spectrum-gray-75, var(--spectrum-gray-100)); }
+    .property-card, .example-card, .deprecation-card { border: 1px solid var(--spectrum-gray-300); border-radius: 12px; padding: 14px; background: var(--spectrum-gray-75, var(--spectrum-gray-100)); }
+    .deprecation-card { border-left: 4px solid var(--spectrum-orange-600); }
+    .deprecation-card.done { border-left-color: var(--spectrum-green-600); }
+    .deprecation-form { display: grid; gap: 10px; margin-top: 12px; padding: 12px; border: 1px dashed var(--spectrum-orange-600); border-radius: 10px; background: var(--spectrum-gray-50); }
+    .migration-item { border: 1px solid var(--spectrum-gray-300); border-radius: 10px; padding: 10px 12px; margin-top: 10px; background: var(--spectrum-gray-50); }
+    .migration-item.done { opacity: .72; }
+    .migration-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+    .pill.deprecated { background: var(--spectrum-orange-300); }
     .property-head, .example-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 10px; }
     .property-head strong, .example-head strong { flex: 1; }
     .inline { display: flex; align-items: center; gap: 8px; font-size: 12px; }
@@ -246,7 +257,16 @@ export class SpecA11yWorkbench extends LitElement {
           <p>${component.purpose}</p>
         </div>
         <div class="actions">
-          <select aria-label="组件状态" .value=${component.status} @change=${(event: Event) => this.store.updateComponent({ status: (event.currentTarget as HTMLSelectElement).value as ComponentSpec['status'] })}>
+          <select aria-label="组件状态" .value=${component.status} @change=${(event: Event) => {
+            const control = event.currentTarget as HTMLSelectElement;
+            const next = control.value as ComponentSpec['status'];
+            if (next === 'published' && this.store.hasPendingMigrations(component)) {
+              control.value = component.status;
+              this.flash('存在未完成的废弃迁移，组件不能进入已发布状态');
+              return;
+            }
+            this.store.updateComponent({ status: next });
+          }}>
             <option value="draft">草稿</option>
             <option value="review">待审</option>
             <option value="published">已发布</option>
@@ -296,8 +316,9 @@ export class SpecA11yWorkbench extends LitElement {
           <sp-button size="s" variant="secondary" @click=${() => this.store.addProperty()}>新增属性</sp-button>
         </div>
         <div class="property-list">
-          ${component.properties.length ? repeat(component.properties, (item) => item.id, (property) => this.renderProperty(property)) : html`<div class="empty">尚未定义属性。</div>`}
+          ${component.properties.length ? repeat(component.properties, (item) => item.id, (property) => this.renderProperty(component, property)) : html`<div class="empty">尚未定义属性。</div>`}
         </div>
+        ${this.renderDeprecations(component)}
         <div class="form-grid" style="margin-top: 18px">
           <label class="field full"><span>状态说明</span><textarea .value=${component.states} @change=${(event: Event) => this.store.updateComponent({ states: (event.currentTarget as HTMLTextAreaElement).value })}></textarea></label>
           <label class="field full"><span>交互签名（修改后会标记关联示例失效）</span><textarea .value=${component.interactionSignature} @change=${(event: Event) => this.store.updateComponent({ interactionSignature: (event.currentTarget as HTMLTextAreaElement).value }, true)}></textarea></label>
@@ -306,11 +327,14 @@ export class SpecA11yWorkbench extends LitElement {
     `;
   }
 
-  private renderProperty(property: PropertySpec): TemplateResult {
+  private renderProperty(component: ComponentSpec, property: PropertySpec): TemplateResult {
+    const deprecation = component.deprecations.find((record) => record.propertyId === property.id && record.status !== 'done');
     return html`
       <article class="property-card">
         <div class="property-head">
           <strong>${property.name || '未命名属性'}</strong>
+          ${deprecation ? html`<span class="pill deprecated">已废弃 · r${deprecation.sunsetVersion} 失效</span>` : nothing}
+          <sp-action-button size="s" label="废弃属性" ?disabled=${Boolean(deprecation)} @click=${() => this.openDeprecation(component, property)}>废弃</sp-action-button>
           <sp-action-button size="s" label="删除属性" @click=${() => this.store.removeProperty(property.id)}>删除</sp-action-button>
         </div>
         <div class="form-grid">
@@ -320,6 +344,89 @@ export class SpecA11yWorkbench extends LitElement {
           <label class="inline"><input type="checkbox" .checked=${property.required} @change=${(event: Event) => this.store.updateProperty(property.id, { required: (event.currentTarget as HTMLInputElement).checked })} /> 必填属性</label>
           <label class="field full"><span>属性说明</span><textarea .value=${property.description} @change=${(event: Event) => this.store.updateProperty(property.id, { description: (event.currentTarget as HTMLTextAreaElement).value })}></textarea></label>
         </div>
+        ${this.deprecatingPropertyId === property.id ? this.renderDeprecationForm(component, property) : nothing}
+      </article>
+    `;
+  }
+
+  private openDeprecation(component: ComponentSpec, property: PropertySpec) {
+    this.deprecatingPropertyId = property.id;
+    this.deprecationDraft = { replacementId: '', sunsetVersion: component.revision + 1 };
+  }
+
+  private renderDeprecationForm(component: ComponentSpec, property: PropertySpec): TemplateResult {
+    const candidates = component.properties.filter((item) => item.id !== property.id);
+    const affected = component.examples.filter((example) => example.propertyIds.includes(property.id) || example.code.includes(property.name));
+    return html`
+      <div class="deprecation-form" role="group" aria-label="废弃属性 ${property.name}">
+        <div class="inline"><strong>废弃 ${property.name}</strong><span>将影响 ${affected.length} 个示例，迁移完成前组件不能发布。</span></div>
+        <label class="field">
+          <span>替代属性</span>
+          <select .value=${this.deprecationDraft.replacementId} @change=${(event: Event) => { this.deprecationDraft = { ...this.deprecationDraft, replacementId: (event.currentTarget as HTMLSelectElement).value }; }}>
+            <option value="">无合适替代（保留为破坏性变更）</option>
+            ${candidates.map((item) => html`<option value=${item.id}>${item.name}</option>`)}
+          </select>
+        </label>
+        <label class="field">
+          <span>失效版本（当前 r${component.revision}）</span>
+          <input type="text" inputmode="numeric" .value=${String(this.deprecationDraft.sunsetVersion)} @change=${(event: Event) => {
+            const parsed = Number.parseInt((event.currentTarget as HTMLInputElement).value, 10);
+            this.deprecationDraft = { ...this.deprecationDraft, sunsetVersion: Number.isFinite(parsed) ? parsed : component.revision + 1 };
+          }} />
+        </label>
+        <div class="inline">
+          <sp-button size="s" variant="accent" @click=${() => {
+            this.store.deprecateProperty(property.id, this.deprecationDraft.replacementId || null, this.deprecationDraft.sunsetVersion);
+            this.deprecatingPropertyId = null;
+            this.flash(this.deprecationDraft.replacementId ? '已记录废弃，请逐条迁移关联示例' : '已记录为破坏性变更，请逐条确认关联示例');
+          }}>确认废弃</sp-button>
+          <sp-button size="s" variant="secondary" @click=${() => { this.deprecatingPropertyId = null; }}>取消</sp-button>
+        </div>
+      </div>
+    `;
+  }
+
+  private renderDeprecations(component: ComponentSpec): TemplateResult | typeof nothing {
+    if (!component.deprecations.length) return nothing;
+    return html`
+      <section style="margin-top: 18px" aria-label="属性废弃与迁移">
+        <div class="property-head"><h2>属性废弃与迁移</h2></div>
+        <div class="property-list">
+          ${repeat(component.deprecations, (record) => record.id, (record) => this.renderDeprecation(record))}
+        </div>
+      </section>
+    `;
+  }
+
+  private renderDeprecation(record: DeprecationRecord): TemplateResult {
+    const doneCount = record.migrations.filter((migration) => migration.done).length;
+    return html`
+      <article class="deprecation-card ${record.status === 'done' ? 'done' : ''}">
+        <div class="property-head">
+          <strong>${record.propertyName} → ${record.replacementName || '破坏性变更'}</strong>
+          <span class="pill ${record.status === 'done' ? 'published' : 'deprecated'}">${record.status === 'done' ? '迁移完成' : `迁移中 ${doneCount}/${record.migrations.length}`}</span>
+        </div>
+        <div class="inline" style="margin-bottom: 4px">
+          <span>失效版本 r${record.sunsetVersion} · 记录于 ${new Date(record.createdAt).toLocaleString('zh-CN')}</span>
+          ${record.status === 'done' ? html`<span>属性可安全删除。</span>` : html`<span>完成全部示例迁移前，组件不能进入已发布状态。</span>`}
+        </div>
+        ${record.migrations.length ? record.migrations.map((migration) => html`
+          <div class="migration-item ${migration.done ? 'done' : ''}">
+            <div class="migration-head">
+              <strong>${migration.exampleTitle}</strong>
+              ${migration.done
+                ? html`<span class="pill published">已迁移 · ${new Date(migration.doneAt as string).toLocaleString('zh-CN')}</span>`
+                : html`
+                  <span class="inline">
+                    <sp-button size="s" variant="accent" @click=${() => { this.store.completeDeprecationMigration(record.id, migration.exampleId); this.flash(`示例「${migration.exampleTitle}」已迁移`); }}>${record.replacementName ? `迁移到 ${record.replacementName}` : '确认已处理'}</sp-button>
+                    <sp-button size="s" variant="secondary" @click=${() => { this.tab = 'examples'; }}>查看示例</sp-button>
+                  </span>
+                `}
+            </div>
+            <span style="font-size: 12px; color: var(--spectrum-gray-700)">旧引用：</span>
+            <pre>${migration.oldReference}</pre>
+          </div>
+        `) : html`<div class="inline">没有示例引用该属性，无需迁移。</div>`}
       </article>
     `;
   }
