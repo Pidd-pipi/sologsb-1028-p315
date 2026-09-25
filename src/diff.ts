@@ -23,5 +23,8 @@ export function diffAgainstSnapshot(component: ComponentSpec, snapshot?: Compone
   const beforeExamples = format(snapshot.component.examples);
   const afterExamples = format(component.examples);
   if (beforeExamples !== afterExamples) rows.push({ field: 'examples', before: beforeExamples, after: afterExamples });
+  const beforeDeprecations = format(snapshot.component.deprecations ?? []);
+  const afterDeprecations = format(component.deprecations);
+  if (beforeDeprecations !== afterDeprecations) rows.push({ field: 'deprecations', before: beforeDeprecations, after: afterDeprecations });
   return rows;
 }
